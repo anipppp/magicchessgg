@@ -25,12 +25,9 @@ ALL_STAGES = {
 }
 
 def clean_image_for_ocr(img_crop, invert=False):
-    """Fungsi OpenCV untuk membuat teks lebih tajam dibaca OCR"""
-    # Ubah ke Grayscale
+    """Membersihkan gambar dengan OpenCV agar Tesseract mudah membaca teks"""
     gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
-    # Perbesar gambar agar teks lebih jelas (Interpolasi)
     gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    # Binarization (Jadikan murni Hitam/Putih)
     _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
     if invert:
         thresh = cv2.bitwise_not(thresh)
@@ -43,31 +40,39 @@ def get_stage_index(stage_text):
             return key
     return None
 
-@app.route('/predict', methods=['POST'])
-def predict_matchup():
-    if 'screenshot' not in request.files:
-        return jsonify({"error": "Tidak ada file gambar yang dikirim"}), 400
+# Endpoint /ocr menerima GET (untuk test browser) dan POST (untuk terima gambar)
+@app.route('/ocr', methods=['GET', 'POST'])
+def process_ocr():
+    # Tangani request GET dari Browser (Mencegah error 405 Method Not Allowed)
+    if request.method == 'GET':
+        return jsonify({
+            "pesan": "Kirim POST request dengan form-data (key: 'image') berisi file gambar ke endpoint /ocr",
+            "status": "API OCR Aktif!"
+        })
+
+    # --- LOGIKA POST (Menerima Gambar dari PHP) ---
+    if 'image' not in request.files:
+        return jsonify({"error": "Tidak ada file gambar yang dikirim dengan key 'image'"}), 400
     
-    file = request.files['screenshot']
+    file = request.files['image']
     npimg = np.fromfile(file, np.uint8)
     img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
     
+    if img is None:
+        return jsonify({"error": "File yang dikirim bukan gambar yang valid"}), 400
+
     H, W = img.shape[:2]
     
-    # KORDINAT CROP (Bisa kamu sesuaikan rasionya jika meleset)
-    # img[y1:y2, x1:x2]
+    # 1. Ekstrak Teks Stage (Posisi tengah atas)
     stage_crop = img[int(H*0.015):int(H*0.055), int(W*0.45):int(W*0.55)]
-    
-    # Lakukan OCR pada Stage
     stage_processed = clean_image_for_ocr(stage_crop, invert=False)
     stage_text = pytesseract.image_to_string(stage_processed, config='--psm 7').strip()
-    current_round_idx = get_stage_index(stage_text)
     
+    current_round_idx = get_stage_index(stage_text)
     if not current_round_idx:
-        return jsonify({"error": f"Stage tidak dikenali atau PvE. Teks terbaca: '{stage_text}'"}), 400
+        return jsonify({"error": f"Stage tidak valid atau merupakan PvE. Terbaca: '{stage_text}'"}), 400
 
-    # SIMULASI PENCARIAN BARIS PEMAIN
-    # Mengingat gambar leaderboard ukurannya tetap, kita bagi menjadi 8 baris
+    # 2. Cari baris "Me" (Biel) berdasarkan brightness di area Leaderboard
     lb_x1, lb_x2 = int(W*0.84), int(W*0.98)
     lb_y_start, lb_y_end = int(H*0.08), int(H*0.70)
     row_height = (lb_y_end - lb_y_start) / 8.0
@@ -75,26 +80,26 @@ def predict_matchup():
     my_row = None
     max_brightness = 0
     
-    # Deteksi baris yang punya background paling terang (Itu adalah Kamu/Biel)
     for i in range(8):
         y_center = int(lb_y_start + (i * row_height) + (row_height * 0.2))
         x_center = int((lb_x1 + lb_x2) / 2)
         pixel = img[y_center, x_center]
-        brightness = int(pixel[0]) + int(pixel[1]) + int(pixel[2]) # B+G+R
+        brightness = int(pixel[0]) + int(pixel[1]) + int(pixel[2])
         
         if brightness > max_brightness:
             max_brightness = brightness
             my_row = i
             
     if my_row is None or max_brightness < 200:
-        return jsonify({"error": "Gagal menemukan player utama (Highlight background tidak terdeteksi)"}), 400
+        return jsonify({"error": "Gagal menemukan posisi Anda (Highlight background tidak terdeteksi)"}), 400
 
+    # 3. Tentukan baris musuh (Ganjil/Genap)
     enemy_row = my_row + 1 if my_row % 2 == 0 else my_row - 1
 
+    # 4. Fungsi Crop Nama (Abaikan avatar & HP)
     def crop_name(row_idx):
         y1 = int(lb_y_start + (row_idx * row_height))
-        y2 = int(y1 + (row_height * 0.45)) # Ambil area atas saja (menghindari bar HP)
-        # Ambil x1 sedikit lebih ke kanan untuk menghindari ikon Avatar
+        y2 = int(y1 + (row_height * 0.45))
         return img[y1:y2, int(W*0.88):int(W*0.95)]
 
     my_name_crop = crop_name(my_row)
@@ -106,7 +111,11 @@ def predict_matchup():
     my_name = pytesseract.image_to_string(my_name_processed, config='--psm 7').strip()
     enemy_name = pytesseract.image_to_string(enemy_name_processed, config='--psm 7').strip()
 
-    # --- LOGIKA MATRIKS PREDIKSI ---
+    # Bersihkan karakter aneh dari hasil OCR
+    my_name = ''.join(e for e in my_name if e.isalnum() or e.isspace())
+    enemy_name = ''.join(e for e in enemy_name if e.isalnum() or e.isspace())
+
+    # 5. Pencocokan Matriks Rotasi
     def add_to_map(test_map, slot, name):
         if not name: return True
         name = name.lower()
@@ -128,9 +137,9 @@ def predict_matchup():
             break
 
     if not found_map:
-        return jsonify({"error": f"Matriks Gagal. {my_name} vs {enemy_name} di Stage Index {current_round_idx} tidak sesuai jadwal algoritma."}), 400
+        return jsonify({"error": f"Algoritma gagal mencocokkan {my_name} vs {enemy_name} di {ALL_STAGES[current_round_idx]}"}), 400
 
-    # Buat Peta Riwayat Pertemuan Lengkap (14 Round)
+    # 6. Susun Prediksi 14 Round
     name_to_slot = {v: k for k, v in found_map.items()}
     my_slot = name_to_slot.get(my_name.lower())
     
@@ -138,16 +147,17 @@ def predict_matchup():
     for round_idx in range(1, 15):
         rot_key = ((round_idx - 1) % 7) + 1
         enemy_slt = SCHEDULE[rot_key][my_slot]
-        e_name = found_map.get(enemy_slt, f"Slot_{enemy_slt}").capitalize()
+        e_name = found_map.get(enemy_slt, f"Player_Slot_{enemy_slt}").capitalize()
         predictions.append({
             "stage": ALL_STAGES[round_idx],
             "me": my_name.capitalize(),
             "enemy": e_name
         })
 
+    # Return response ke PHP
     return jsonify({
         "status": "success",
-        "scanned_data": {"stage": ALL_STAGES[current_round_idx], "me": my_name, "enemy": enemy_name},
+        "scanned_data": {"stage": ALL_STAGES[current_round_idx], "me": my_name.capitalize(), "enemy": enemy_name.capitalize()},
         "predictions": predictions
     })
 
