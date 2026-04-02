@@ -6,6 +6,10 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Konfigurasi Path Tesseract untuk Linux (Railway)
+pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+
+# Matriks Rotasi Round-Robin 8 Player
 SCHEDULE = {
     1: {0:2, 2:0, 1:5, 5:1, 3:6, 6:3, 4:7, 7:4},
     2: {0:4, 4:0, 1:7, 7:1, 2:6, 6:2, 3:5, 5:3},
@@ -24,6 +28,7 @@ ALL_STAGES = {
 }
 
 def clean_image_for_ocr(img_crop, invert=False):
+    """Preprocessing gambar menggunakan OpenCV"""
     gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
@@ -32,6 +37,7 @@ def clean_image_for_ocr(img_crop, invert=False):
     return thresh
 
 def get_stage_index(stage_text):
+    """Normalisasi teks Stage dari OCR"""
     stage_clean = stage_text.replace("L", "I").replace("1", "I").replace(" ", "").upper()
     for key, val in ALL_STAGES.items():
         if val.replace(" ", "").upper() in stage_clean:
@@ -40,6 +46,7 @@ def get_stage_index(stage_text):
 
 @app.route('/ocr', methods=['GET', 'POST'])
 def process_ocr():
+    # Mengatasi error 405 Method Not Allowed
     if request.method == 'GET':
         return jsonify({
             "pesan": "Kirim POST request dengan form-data (key: 'image') berisi file gambar ke endpoint /ocr",
@@ -51,24 +58,29 @@ def process_ocr():
     
     file = request.files['image']
     
-    # [FIX 1] Membaca file gambar dari buffer memori Flask
-    file_bytes = file.read()
-    npimg = np.frombuffer(file_bytes, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    # Baca file dari buffer memori (RAM)
+    try:
+        file_bytes = file.read()
+        npimg = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    except Exception as e:
+        return jsonify({"error": f"Gagal membaca file: {str(e)}"}), 400
     
     if img is None:
         return jsonify({"error": "File yang dikirim bukan gambar yang valid"}), 400
 
     H, W = img.shape[:2]
     
+    # --- 1. OCR STAGE ---
     stage_crop = img[int(H*0.015):int(H*0.055), int(W*0.45):int(W*0.55)]
     stage_processed = clean_image_for_ocr(stage_crop, invert=False)
     stage_text = pytesseract.image_to_string(stage_processed, config='--psm 7').strip()
     
     current_round_idx = get_stage_index(stage_text)
     if not current_round_idx:
-        return jsonify({"error": f"Stage tidak valid atau merupakan PvE. Terbaca: '{stage_text}'"}), 400
+        return jsonify({"error": f"Stage tidak valid/PvE. Terbaca: '{stage_text}'"}), 400
 
+    # --- 2. DETEKSI PLAYER 'ME' ---
     lb_x1, lb_x2 = int(W*0.84), int(W*0.98)
     lb_y_start, lb_y_end = int(H*0.08), int(H*0.70)
     row_height = (lb_y_end - lb_y_start) / 8.0
@@ -87,8 +99,9 @@ def process_ocr():
             my_row = i
             
     if my_row is None or max_brightness < 200:
-        return jsonify({"error": "Gagal menemukan posisi Anda (Highlight background tidak terdeteksi)"}), 400
+        return jsonify({"error": "Gagal mendeteksi posisi Anda di leaderboard."}), 400
 
+    # --- 3. CROP NAMA (ME & ENEMY) ---
     enemy_row = my_row + 1 if my_row % 2 == 0 else my_row - 1
 
     def crop_name(row_idx):
@@ -96,51 +109,44 @@ def process_ocr():
         y2 = int(y1 + (row_height * 0.45))
         return img[y1:y2, int(W*0.88):int(W*0.95)]
 
-    my_name_crop = crop_name(my_row)
-    enemy_name_crop = crop_name(enemy_row)
-
-    my_name_processed = clean_image_for_ocr(my_name_crop, invert=True)
-    enemy_name_processed = clean_image_for_ocr(enemy_name_crop, invert=True)
+    my_name_processed = clean_image_for_ocr(crop_name(my_row), invert=True)
+    enemy_name_processed = clean_image_for_ocr(crop_name(enemy_row), invert=True)
 
     my_name = pytesseract.image_to_string(my_name_processed, config='--psm 7').strip()
     enemy_name = pytesseract.image_to_string(enemy_name_processed, config='--psm 7').strip()
 
-    my_name = ''.join(e for e in my_name if e.isalnum() or e.isspace())
-    enemy_name = ''.join(e for e in enemy_name if e.isalnum() or e.isspace())
+    # Bersihkan noise teks
+    my_name = ''.join(e for e in my_name if e.isalnum()).lower()
+    enemy_name = ''.join(e for e in enemy_name if e.isalnum()).lower()
 
-    def add_to_map(test_map, slot, name):
-        if not name: return True
-        name = name.lower()
-        if slot in test_map and test_map[slot] != name: return False
-        if name in test_map.values() and list(test_map.keys())[list(test_map.values()).index(name)] != slot: return False
-        test_map[slot] = name
-        return True
-
+    # --- 4. ALGORITMA MATRIKS ---
     found_map = None
     for slot_a in range(8):
         test_map = {}
-        valid = True
-        valid &= add_to_map(test_map, slot_a, my_name)
-        enemy_slot_a = SCHEDULE[((current_round_idx - 1) % 7) + 1][slot_a]
-        valid &= add_to_map(test_map, enemy_slot_a, enemy_name)
+        # Simulasi slot A adalah Kita
+        test_map[slot_a] = my_name
+        # Siapa musuh slot A di round ini menurut jadwal?
+        rot_idx = ((current_round_idx - 1) % 7) + 1
+        enemy_slot_a = SCHEDULE[rot_idx][slot_a]
+        test_map[enemy_slot_a] = enemy_name
         
-        if valid:
+        # Validasi sederhana (Nama tidak boleh sama di slot berbeda)
+        if len(set(test_map.values())) == len(test_map):
             found_map = test_map
+            my_slot = slot_a
             break
 
     if not found_map:
-        return jsonify({"error": f"Algoritma gagal mencocokkan {my_name} vs {enemy_name} di {ALL_STAGES[current_round_idx]}"}), 400
+        return jsonify({"error": "Matriks gagal sinkron dengan jadwal game."}), 400
 
-    name_to_slot = {v: k for k, v in found_map.items()}
-    my_slot = name_to_slot.get(my_name.lower())
-    
+    # --- 5. GENERATE PREDIKSI ---
     predictions = []
-    for round_idx in range(1, 15):
-        rot_key = ((round_idx - 1) % 7) + 1
+    for r_idx in range(1, 15):
+        rot_key = ((r_idx - 1) % 7) + 1
         enemy_slt = SCHEDULE[rot_key][my_slot]
-        e_name = found_map.get(enemy_slt, f"Player_Slot_{enemy_slt}").capitalize()
+        e_name = found_map.get(enemy_slt, f"P-{enemy_slt}").capitalize()
         predictions.append({
-            "stage": ALL_STAGES[round_idx],
+            "stage": ALL_STAGES[r_idx],
             "me": my_name.capitalize(),
             "enemy": e_name
         })
@@ -152,6 +158,12 @@ def process_ocr():
     })
 
 if __name__ == '__main__':
-    # [FIX 2] Memastikan PORT menjadi integer untuk mencegah Error '$PORT' is not a valid port number
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # SISTEM ANTI-CRASH PORT RAILWAY
+    raw_port = os.environ.get('PORT', '8080')
+    try:
+        actual_port = int(raw_port)
+    except ValueError:
+        print(f"Railway Error: Port {raw_port} invalid, forcing 8080")
+        actual_port = 8080
+        
+    app.run(host='0.0.0.0', port=actual_port)
