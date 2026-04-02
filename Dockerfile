@@ -1,23 +1,31 @@
-# Menggunakan base image OS Linux yang sudah ada Python-nya
+# Gunakan base image Python ringan
 FROM python:3.9-slim
 
-# Update server Linux dan Install Tesseract OCR beserta bahasa Indonesia & Inggris
+# Supaya output langsung tampil (no buffering)
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies + Tesseract OCR (Indonesia & Inggris)
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-ind \
     tesseract-ocr-eng \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Menentukan folder kerja di dalam server Railway
+# Set working directory
 WORKDIR /app
 
-# Memasukkan file requirements dan menginstal semua library
+# Copy requirements dulu (biar cache Docker optimal)
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Memasukkan seluruh sisa kode aplikasi (app.py)
+# Copy semua file project
 COPY . .
 
-# Menjalankan aplikasi menggunakan Gunicorn
-# $PORT akan otomatis diisi oleh sistem Railway
-CMD gunicorn --bind 0.0.0.0:$PORT app:app
+# Railway pakai PORT dari environment
+EXPOSE 8080
+
+# Run app pakai gunicorn (WAJIB untuk production)
+CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "app:app"]
