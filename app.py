@@ -6,7 +6,6 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Matriks Rotasi Round-Robin (0-7 adalah ID slot)
 SCHEDULE = {
     1: {0:2, 2:0, 1:5, 5:1, 3:6, 6:3, 4:7, 7:4},
     2: {0:4, 4:0, 1:7, 7:1, 2:6, 6:2, 3:5, 5:3},
@@ -25,7 +24,6 @@ ALL_STAGES = {
 }
 
 def clean_image_for_ocr(img_crop, invert=False):
-    """Membersihkan gambar dengan OpenCV agar Tesseract mudah membaca teks"""
     gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
@@ -40,22 +38,22 @@ def get_stage_index(stage_text):
             return key
     return None
 
-# Endpoint /ocr menerima GET (untuk test browser) dan POST (untuk terima gambar)
 @app.route('/ocr', methods=['GET', 'POST'])
 def process_ocr():
-    # Tangani request GET dari Browser (Mencegah error 405 Method Not Allowed)
     if request.method == 'GET':
         return jsonify({
             "pesan": "Kirim POST request dengan form-data (key: 'image') berisi file gambar ke endpoint /ocr",
             "status": "API OCR Aktif!"
         })
 
-    # --- LOGIKA POST (Menerima Gambar dari PHP) ---
     if 'image' not in request.files:
         return jsonify({"error": "Tidak ada file gambar yang dikirim dengan key 'image'"}), 400
     
     file = request.files['image']
-    npimg = np.fromfile(file, np.uint8)
+    
+    # [FIX 1] Membaca file gambar dari buffer memori Flask
+    file_bytes = file.read()
+    npimg = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
     
     if img is None:
@@ -63,7 +61,6 @@ def process_ocr():
 
     H, W = img.shape[:2]
     
-    # 1. Ekstrak Teks Stage (Posisi tengah atas)
     stage_crop = img[int(H*0.015):int(H*0.055), int(W*0.45):int(W*0.55)]
     stage_processed = clean_image_for_ocr(stage_crop, invert=False)
     stage_text = pytesseract.image_to_string(stage_processed, config='--psm 7').strip()
@@ -72,7 +69,6 @@ def process_ocr():
     if not current_round_idx:
         return jsonify({"error": f"Stage tidak valid atau merupakan PvE. Terbaca: '{stage_text}'"}), 400
 
-    # 2. Cari baris "Me" (Biel) berdasarkan brightness di area Leaderboard
     lb_x1, lb_x2 = int(W*0.84), int(W*0.98)
     lb_y_start, lb_y_end = int(H*0.08), int(H*0.70)
     row_height = (lb_y_end - lb_y_start) / 8.0
@@ -93,10 +89,8 @@ def process_ocr():
     if my_row is None or max_brightness < 200:
         return jsonify({"error": "Gagal menemukan posisi Anda (Highlight background tidak terdeteksi)"}), 400
 
-    # 3. Tentukan baris musuh (Ganjil/Genap)
     enemy_row = my_row + 1 if my_row % 2 == 0 else my_row - 1
 
-    # 4. Fungsi Crop Nama (Abaikan avatar & HP)
     def crop_name(row_idx):
         y1 = int(lb_y_start + (row_idx * row_height))
         y2 = int(y1 + (row_height * 0.45))
@@ -111,11 +105,9 @@ def process_ocr():
     my_name = pytesseract.image_to_string(my_name_processed, config='--psm 7').strip()
     enemy_name = pytesseract.image_to_string(enemy_name_processed, config='--psm 7').strip()
 
-    # Bersihkan karakter aneh dari hasil OCR
     my_name = ''.join(e for e in my_name if e.isalnum() or e.isspace())
     enemy_name = ''.join(e for e in enemy_name if e.isalnum() or e.isspace())
 
-    # 5. Pencocokan Matriks Rotasi
     def add_to_map(test_map, slot, name):
         if not name: return True
         name = name.lower()
@@ -139,7 +131,6 @@ def process_ocr():
     if not found_map:
         return jsonify({"error": f"Algoritma gagal mencocokkan {my_name} vs {enemy_name} di {ALL_STAGES[current_round_idx]}"}), 400
 
-    # 6. Susun Prediksi 14 Round
     name_to_slot = {v: k for k, v in found_map.items()}
     my_slot = name_to_slot.get(my_name.lower())
     
@@ -154,7 +145,6 @@ def process_ocr():
             "enemy": e_name
         })
 
-    # Return response ke PHP
     return jsonify({
         "status": "success",
         "scanned_data": {"stage": ALL_STAGES[current_round_idx], "me": my_name.capitalize(), "enemy": enemy_name.capitalize()},
@@ -162,4 +152,6 @@ def process_ocr():
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
+    # [FIX 2] Memastikan PORT menjadi integer untuk mencegah Error '$PORT' is not a valid port number
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
